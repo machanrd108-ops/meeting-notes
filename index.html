@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>即時語音會議紀錄 AI</title>
+  <style>
+    body { font-family: Arial, "Microsoft JhengHei", sans-serif; margin: 20px; line-height: 1.6; background-color: #f9f9f9; }
+    .container { max-width: 700px; margin: 0 auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h2 { margin-top: 0; color: #333; }
+    .btn { padding: 10px 20px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; margin-right: 10px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-start { background-color: #4CAF50; color: white; }
+    .btn-stop { background-color: #f44336; color: white; }
+    .btn-clear { background-color: #9e9e9e; color: white; }
+    .btn-submit { background-color: #2196F3; color: white; margin-top: 15px; }
+    #transcript { width: 100%; height: 240px; margin-top: 15px; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 5px; font-size: 14px; }
+    .status { margin-top: 10px; font-weight: bold; color: #666; }
+    .status.error { color: #d32f2f; }
+    .hint { font-size: 12px; color: #888; margin-top: 8px; }
+    #result a { color: #1a73e8; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>🎙️ 即時語音會議紀錄 AI</h2>
+
+    <div>
+      <button id="startBtn" class="btn btn-start">開始錄音</button>
+      <button id="stopBtn" class="btn btn-stop" disabled>停止錄音</button>
+      <button id="clearBtn" class="btn btn-clear">清除</button>
+    </div>
+
+    <div class="status" id="status">狀態：待命</div>
+
+    <textarea id="transcript" placeholder="即時逐字稿將顯示於此，錄音停止後也可以手動修正錯字..."></textarea>
+
+    <button id="submitBtn" class="btn btn-submit">整理並匯出至 Google Doc</button>
+    <div id="result" class="status"></div>
+
+    <div class="hint">
+      提醒：語音會被送至瀏覽器的雲端辨識服務，逐字稿會再送往 Gemini 處理。敏感會議請先取得與會者同意。
+    </div>
+  </div>
+
+  <script>
+    // ★★★ 請把下面這行換成你的 GAS Web App 網址（結尾是 /exec）★★★
+    const GAS_URL = 'https://script.google.com/macros/s/AKfycbwmY5fYK7jDGHtDe6JwBE2a4kQKoV_G2hRWyb5Tk-QGHMymuLKTFpUVNFNMykfj-OZs/exec';
+
+    const $ = (id) => document.getElementById(id);
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    let recognition = null;
+    let wantListening = false;     // 使用者是否希望持續錄音
+    let committed = '';            // 已確定的文字（含手動修正後的內容）
+    let fatalError = false;
+
+    function setStatus(msg, isError) {
+      const el = $('status');
+      el.innerText = msg;
+      el.className = 'status' + (isError ? ' error' : '');
+    }
+
+    function setButtons(listening) {
+      $('startBtn').disabled = listening;
+      $('stopBtn').disabled = !listening;
+    }
+
+    if (!SR) {
+      setStatus('此瀏覽器不支援 Web Speech API，請改用 Google Chrome（電腦版）。你仍可手動貼上逐字稿再送出整理。', true);
+      $('startBtn').disabled = true;
+    } else {
+      recognition = new SR();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'zh-TW';
+
+      recognition.onresult = (event) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const text = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            committed += text + '\n';
+          } else {
+            interim += text;
+          }
+        }
+        $('transcript').value = committed + interim;
+      };
+
+      recognition.onerror = (event) => {
+        // no-speech / aborted 屬於正常現象，由 onend 自動重啟處理
+        if (event.error === 'no-speech' || event.error === 'aborted') return;
+
+        fatalError = true;
+        wantListening = false;
+        let msg = '語音辨識錯誤：' + event.error;
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          msg += '（麥克風被拒絕。請點網址列左側的鎖頭圖示，把麥克風改成「允許」後重新整理頁面。）';
+        } else if (event.error === 'network') {
+          msg += '（網路問題，語音辨識需要連線）';
+        }
+        setStatus(msg, true);
+        setButtons(false);
+      };
+
+      recognition.onend = () => {
+        // 使用者沒按停止卻中斷 → 自動重啟
+        if (wantListening && !fatalError) {
+          try {
+            recognition.start();
+            return;
+          } catch (e) {
+            // 若重啟失敗，落到下方當作停止
+          }
+        }
+        wantListening = false;
+        setButtons(false);
+        if (!fatalError) setStatus('狀態：已停止錄音');
+      };
+    }
+
+    function startRecognition() {
+      if (!recognition) return;
+      // 以文字框現有內容（可能含手動修正）為基底繼續累加
+      committed = $('transcript').value;
+      if (committed && !committed.endsWith('\n')) committed += '\n';
+
+      fatalError = false;
+      wantListening = true;
+      try {
+        recognition.start();
+        setStatus('狀態：正在即時聆聽中...');
+        setButtons(true);
+      } catch (e) {
+        wantListening = false;
+        setStatus('無法開始錄音：' + e.message, true);
+      }
+    }
+
+    function stopRecognition() {
+      wantListening = false;
+      if (recognition) recognition.stop();
+      // 停止後把文字框內容視為最終版本（包含使用者手動修正）
+      committed = $('transcript').value;
+    }
+
+    function clearTranscript() {
+      if ($('transcript').value.trim() && !confirm('確定要清除目前的逐字稿嗎？')) return;
+      committed = '';
+      $('transcript').value = '';
+      $('result').innerHTML = '';
+    }
+
+    async function submitToAI() {
+      if (wantListening) stopRecognition();
+
+      const transcript = $('transcript').value.trim();
+      if (!transcript) { alert('沒有可整理的逐字稿內容'); return; }
+
+      if (!GAS_URL || GAS_URL.indexOf('script.google.com') === -1) {
+        setStatus('尚未設定 GAS_URL，請編輯 index.html 填入你的 Web App 網址。', true);
+        return;
+      }
+
+      let token = localStorage.getItem('access_token');
+      if (!token) {
+        token = prompt('請輸入存取密碼：');
+        if (!token) return;
+      }
+
+      setStatus('狀態：正在傳送給 AI 整理並產生 Google Doc，請稍候...');
+      $('submitBtn').disabled = true;
+      $('result').innerHTML = '';
+
+      try {
+        const res = await fetch(GAS_URL, {
+          method: 'POST',
+          // 用 text/plain 可避免 CORS 預檢請求（GAS 不支援 OPTIONS）
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ token: token, transcript: transcript })
+        });
+        const data = await res.json();
+
+        if (!data.ok) {
+          if (data.error === '未授權') localStorage.removeItem('access_token');
+          throw new Error(data.error);
+        }
+
+        localStorage.setItem('access_token', token);
+        setStatus('完成！');
+        const a = document.createElement('a');
+        a.href = data.url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = '開啟會議紀錄：' + data.url;
+        $('result').appendChild(a);
+      } catch (err) {
+        setStatus('發生錯誤：' + err.message, true);
+      } finally {
+        $('submitBtn').disabled = false;
+      }
+    }
+
+    $('startBtn').addEventListener('click', startRecognition);
+    $('stopBtn').addEventListener('click', stopRecognition);
+    $('clearBtn').addEventListener('click', clearTranscript);
+    $('submitBtn').addEventListener('click', submitToAI);
+
+    // 避免誤關分頁導致逐字稿遺失
+    window.addEventListener('beforeunload', (e) => {
+      if ($('transcript').value.trim()) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+  </script>
+</body>
+</html>
